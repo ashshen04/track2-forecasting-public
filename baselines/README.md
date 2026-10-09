@@ -147,7 +147,9 @@ something that will not parse, it emits the unadjusted statistical floor and rec
 human-readable explanation in `forecast_rationale.md`.
 
 **With organizer-provided House access**, the agent uses `MODEL_ENDPOINT`, `MODEL_NAME`,
-`MODEL_TOKEN`, and the authenticated `http_proxy`. It accepts an endpoint root or a `/v1` base
+`MODEL_TOKEN`, and the authenticated HTTP/HTTPS proxy (lowercase or uppercase environment
+variables). HTTPS endpoints use a TLS connection through an authenticated proxy tunnel.
+It accepts an endpoint root or a `/v1` base
 and sends one request through that explicit proxy. It ignores proxy bypass settings, follows no
 redirects, and does not retry or fall back to a direct connection. Missing or invalid House
 configuration produces the labelled statistical fallback above. The organizer controls access;
@@ -161,6 +163,32 @@ These settings do not change the organizer's request allowance or other enforced
 **A floor, not a ceiling.** Whether two scalars from one prompt beat the text-blind floor is
 unmeasured and needs a real endpoint. Read the file for the loop — dated retrieval, a bounded
 model call, a labelled failure path — not for the numbers.
+
+### Optional conservative text experiment
+
+Add `--conservative --n-draws 1000` to the reasoning-agent command above.
+For example, if the statistical standard deviation is 0.09, a `vol_scale` of 1.2
+makes it 0.108. Standard deviation measures the spread around the forecast centre.
+
+This mode limits the mean shift to half the longest-horizon standard deviation.
+It limits the spread multiplier to [1, 1.5], so text cannot narrow the distribution.
+These are experimental bounds, not tuned or validated performance improvements.
+The original mode remains the default.
+The unified `forecast` command selects conservative mode automatically. Pass `--no-text`
+to that command for a statistical-only comparison. Its House-only configuration check
+disables the standalone module's legacy local API-key route.
+
+The model must return a nonblank `because` explanation and a `doc_ids` list for each
+asset. Every cited ID must occur in the dated documents sent to the model. Missing
+or invalid evidence, or invalid numbers, leaves that asset's statistical forecast
+unchanged. This checks citation membership, not whether a document supports the claim.
+The metadata records `text_policy` and the accepted or rejected `text_adjustments`.
+
+This remains a two-scalar overlay: the same absolute shift and spread multiplier
+apply at every horizon for an asset. It does not model the timing or persistence
+of a policy effect. Comparing it with the same statistical forecast without text
+is a separate experiment. Tests with simulated replies establish mechanics only.
+With no model endpoint configured, it records the unchanged statistical fallback.
 
 ---
 

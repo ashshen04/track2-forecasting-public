@@ -45,7 +45,7 @@ test = ["pytest>=8.0"]
 dev = ["ruff==0.4.7", "mypy==1.19.1"]
 
 [tool.setuptools]
-packages = ["qfbench2_track_forecasting"]
+packages = ["qfbench2_track_forecasting", "baselines"]
 
 [project.scripts]
 # The submission verb. The harness invokes `forecast ...` on PATH.

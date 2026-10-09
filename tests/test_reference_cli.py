@@ -21,7 +21,7 @@ def _panels(values: np.ndarray) -> tuple[dict[str, pd.DataFrame], str]:
     return {"synthetic": frame}, dates[-1].strftime("%Y-%m-%d")
 
 
-def test_level_forecasts_preserve_the_previous_fixed_seed_output() -> None:
+def test_level_forecasts_preserve_the_first_horizon_fixed_seed_output() -> None:
     panels, asof = _panels(100.0 + np.cumsum(np.tile([1.0, 0.0, -1.0, 0.0], 20)))
     samples, stats = cli._draw(panels, ["A"], [1, 21], asof, 500, 17)
     # Recorded by executing the released producer before the return-target correction.
@@ -31,9 +31,33 @@ def test_level_forecasts_preserve_the_previous_fixed_seed_output() -> None:
         [[99.61824444819105, 95.15970482426789]],
         [[99.10901906510834, 93.45386754186264]],
     ]
-    np.testing.assert_allclose(samples[:4], previous, rtol=0, atol=1e-12)
+    # Later horizons now share the first horizon's shocks. Its marginal is unchanged.
+    np.testing.assert_allclose(samples[:4, :, 0], np.array(previous)[:, :, 0], rtol=0, atol=1e-12)
     assert stats["last"] == {"A": 100.0}
     assert stats["n_history_rows"] == 79
+
+
+@pytest.mark.parametrize("target_type", ["level", "log_return"])
+def test_daily_horizons_share_a_path(target_type: str) -> None:
+    # A walk at day 20 contains its day-5 shock plus an independent continuation.
+    values = np.tile([0.001, 0.005, -0.002, 0.004], 20)
+    if target_type == "level":
+        values = 100 + np.cumsum(values)
+    panels, asof = _panels(values)
+    samples, _ = cli._draw(
+        panels, ["A"], [5, 20], asof, 50000, 17, target_type=target_type
+    )
+    early, late = samples[:, 0, 0], samples[:, 0, 1]
+    # Corr(X_5, X_20) = sqrt(5/20) under independent, equal-variance daily shocks.
+    assert np.corrcoef(early, late)[0, 1] == pytest.approx(0.5, abs=0.02)
+    assert abs(np.corrcoef(early, late - early)[0, 1]) < 0.02
+
+
+def test_daily_horizon_order_does_not_change_the_forecast() -> None:
+    panels, asof = _panels(100 + np.cumsum(np.tile([1.0, -1.0], 40)))
+    ordered, _ = cli._draw(panels, ["A"], [5, 20], asof, 500, 17)
+    reversed_grid, _ = cli._draw(panels, ["A"], [20, 5], asof, 500, 17)
+    np.testing.assert_array_equal(ordered, reversed_grid[:, :, ::-1])
 
 
 def test_cumulative_returns_use_the_return_distribution_not_its_order() -> None:

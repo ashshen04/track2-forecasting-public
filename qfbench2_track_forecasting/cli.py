@@ -1,4 +1,9 @@
-"""Track-2 reference submission CLI.
+"""## Executive summary (read this first)
+
+Run a statistical forecast with optional House-model text adjustments. For example,
+`forecast --panels /input/panels --text /input/text --asof YYYY-MM-DD
+--out /output/forecast.parquet` uses conservative text adjustments by default.
+`--no-text` runs the identical statistical model without calling a language model.
 
 Implements the `forecast` verb from the shared submission contract:
 
@@ -11,13 +16,9 @@ and writes the three deliverables the contract requires next to `--out`:
     forecast_meta.json       the sidecar g1_schema validates
     forecast_rationale.md    required, NEVER scored — the derivation, for human review
 
-This is the statistical floor, not a worked example of using text. It reads the panels and
-ignores `--text` entirely, which is stated plainly in the rationale it writes: a submission that
-does this is doing the thing Track 2 exists to measure agents beating. It is here so that a
-participant has something that provably builds, runs offline and passes g0-g3, and can be edited
-into a real agent one step at a time.
-
-Run offline. No network, no model weights, numpy + pandas only.
+Missing House configuration or a failed model reply keeps the statistical forecast and
+records the fallback. The unified entrypoint never uses participant vendor API keys.
+The numerical sampler below remains available independently for historical backtests.
 """
 
 from __future__ import annotations
@@ -36,7 +37,8 @@ from .horizons import HorizonMetadataError, monthly_horizon_steps
 from .limits import ParseLimits
 from .targets import log_return_steps
 
-DEFAULT_DRAWS = 500
+DEFAULT_DRAWS = 1000
+EWMA_HALFLIFE = 20.0  # Observations, fixed before the first diagnostic comparison.
 _RATIONALE_NAME = "forecast_rationale.md"
 
 
@@ -232,15 +234,20 @@ def _draw(
     *,
     target_type: str = "level",
     panel_steps: np.ndarray | None = None,
+    volatility: str = "equal",
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Joint Gaussian walk, using level changes or daily log returns as steps.
 
     Drawing each asset independently would score badly on purpose: the composite puts 0.3 on the
     joint variogram term precisely to catch marginals that were stapled together. So the shared
-    innovation is drawn from the empirical correlation of historical steps. Daily calls retain
-    their existing sqrt(h) scaling. An explicit monthly step matrix selects cumulative paths
+    innovation is drawn from the empirical correlation of historical steps. Daily horizons share
+    a cumulative path, with marginal sqrt(h) scaling. An explicit monthly step matrix selects paths
     in calendar months, including the panel publication lag.
     """
+    if volatility not in ("equal", "ewma"):
+        raise ValueError("volatility must be equal or ewma")
+    if volatility == "ewma" and panel_steps is not None:
+        raise ValueError("EWMA volatility is an experimental daily-only mode")
     rng = np.random.default_rng(seed)
     hist = {a: _series(panels, a, asof) for a in assets}
     returns_target = target_type == "log_return"
@@ -267,6 +274,9 @@ def _draw(
         if monthly
         else {a: _diff_without_gaps(s) for a, s in hist.items()}
     ).dropna()
+
+    steps = steps.tail(120)
+
     if len(steps) < 30:
         raise SystemExit(f"not enough history to estimate covariance ({len(steps)} rows)")
 
@@ -277,6 +287,12 @@ def _draw(
     )
     drift = steps.mean().to_numpy(dtype=float) if returns_target else np.zeros(len(assets))
     sd = steps.std().to_numpy(dtype=float)
+    if volatility == "ewma":
+        # Example: an observation 20 rows older gets half as much weight.
+        # Keep the same 120 rows, drift and correlation to isolate spread estimation.
+        sd = np.sqrt(
+            steps.ewm(halflife=EWMA_HALFLIFE, adjust=True).var(bias=False).iloc[-1]
+        ).to_numpy(dtype=float)
     corr = steps.corr().to_numpy(dtype=float)
     corr = np.nan_to_num(corr, nan=0.0)
     np.fill_diagonal(corr, 1.0)
@@ -307,16 +323,25 @@ def _draw(
             },
         }
     out = np.empty((n_draws, len(assets), len(horizons)), dtype=float)
-    for hi, h in enumerate(horizons):
+    path = np.zeros((n_draws, len(assets)), dtype=float)
+    previous_horizon = 0
+    # Example: day 20 reuses day 5, then adds 15 days of new shocks.
+    # Gaussian increments can be sampled in blocks without visiting every day.
+    for hi in np.argsort(horizons):
+        h = horizons[hi]
         z = rng.standard_normal((n_draws, len(assets))) @ chol.T
+        path += z * (sd * np.sqrt(h - previous_horizon))
         centre = drift * h if returns_target else last
-        out[:, :, hi] = centre + z * (sd * np.sqrt(h))
+        out[:, :, hi] = centre + path
+        previous_horizon = h
     meta = {
         "last": {a: float(last[i]) for i, a in enumerate(assets)},
         "daily_sd": {a: float(sd[i]) for i, a in enumerate(assets)},
         "n_history_rows": int(len(steps)),
         "target_type": target_type,
         "daily_drift": {a: float(drift[i]) for i, a in enumerate(assets)},
+        "volatility": volatility,
+        "ewma_halflife_observations": EWMA_HALFLIFE if volatility == "ewma" else None,
     }
     return out, meta
 
@@ -426,6 +451,8 @@ shape — deliberately not fat-tailed, since nothing here justifies a tail view.
 The draws are **joint**: a single innovation vector is drawn per draw from the empirical
 correlation of {correlation_description} across assets, so cross-asset structure is preserved
 rather than independent marginals. The composite's variogram term scores that structure.
+Later horizons reuse earlier shocks and add independent increments for the remaining days.
+The output keeps the requested horizon keys and their original order.
 
 ## Adjustment ledger
 
@@ -451,7 +478,7 @@ Any evidence at all. It currently uses none beyond the panel's own volatility.
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="forecast",
-        description="QFBench 2.0 Track-2 reference submission (statistical floor).",
+        description="Track-2 joint forecast with conservative House-model text adjustments.",
     )
     p.add_argument("--panels", type=pathlib.Path, required=True)
     p.add_argument("--text", type=pathlib.Path, required=True)
@@ -470,6 +497,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--n-draws", type=int, default=None)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--no-text", action="store_true",
+        help="Use the statistical forecast only; never call a model (text ablation).",
+    )
     a = p.parse_args(argv)
 
     # --panels names the unit root (contract) but a card may still keep a panels/ subdir, so look
@@ -504,6 +535,18 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             f"--n-draws {n_draws} exceeds the contract ceiling {ParseLimits().max_draws}; the "
             "scorer refuses a submission above it"
+        )
+
+    if not a.no_text:
+        from baselines.reasoning_agent import main as reasoning_main
+
+        return reasoning_main(
+            [
+                "--panels", str(a.panels), "--text", str(a.text), "--asof", a.asof,
+                "--card", str(card_path), "--out", str(a.out),
+                "--n-draws", str(n_draws), "--seed", str(a.seed), "--conservative",
+            ],
+            house_only=True,
         )
 
     panels = _read_panels(a.panels)
@@ -543,6 +586,10 @@ def main(argv: list[str] | None = None) -> int:
                 "horizons": horizons,
                 "n_draws": n_draws,
                 "target": tgt.get("target_type", "level"),
+                "reasoning_applied": False,
+                "reasoning_skipped_reason": "disabled by --no-text",
+                "text_policy": "disabled",
+                "text_adjustments": {},
                 "rationale": {
                     "file": _RATIONALE_NAME,
                     "method": "joint gaussian random walk, no text",
