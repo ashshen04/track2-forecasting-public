@@ -1,0 +1,12 @@
+# ## Executive summary (read this first)
+# Send only the forecast code to Docker. Panels, experiments, Git history,
+# local environments and credentials are outside the build context.
+*
+!Dockerfile
+!qfbench2_track_forecasting/
+!qfbench2_track_forecasting/**
+!baselines/
+!baselines/**
+**/__pycache__/
+**/*.pyc
+**/.DS_Store

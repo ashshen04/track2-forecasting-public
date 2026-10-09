@@ -89,3 +89,33 @@ The dependence report explicitly uses `reference minus shuffled`: negative favou
 the original dependence. This differs from the earlier scaffold comparison's order;
 always read the column heading. One permutation and three dates per unit are only
 a diagnostic, not evidence of statistical significance or performance on unseen data.
+
+## Compare equal-weight and EWMA volatility
+
+```bash
+python scripts/backtest.py --models reference reference-ewma \
+  --min-history 121 --folds 3 --n-draws 1000 \
+  --include t2-F1-aud-on-hold-2016 t2-F1-measured-pace-2004 \
+  t2-F3-brexit-joint-2016 t2-F3-covid-curve-2020 \
+  t2-F4-covid-mkt-2020 t2-F4-factor-stress-2008 \
+  --out /private/tmp/t2-ewma-01
+```
+
+For example, a large recent change receives more weight than an equally large old
+change. EWMA means exponentially weighted moving average. This candidate uses
+exponential weights with a fixed half-life of 20 aligned observations: a change
+20 rows older receives half the weight. Pandas computes the bias-corrected weighted
+variance, and its square root supplies the standard deviation.
+
+Both variants use at most the latest 120 aligned changes. Only the standard
+deviations change. Drift, correlation estimates, seeds, draw counts, and origins
+remain identical. Correlations retain equal weights to isolate one modelling choice.
+Monthly targets are outside this experiment. The default `forecast` command still
+uses equal weights; this candidate is available through the numerical sampler and
+backtest runner only.
+
+The report shows each unit's paired scores, within-unit percentage change and fold
+win count. No raw score average across units is meaningful. These six units are the
+existing development subset, not independent validation. Keep experimental results
+outside this public repository. A favourable result needs further chronological
+validation; a mixed result does not justify replacing the default.

@@ -32,6 +32,8 @@ def clean_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "MODEL_THINKING",
         "http_proxy",
         "https_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("MODEL_NAME", "synthetic-model")
@@ -59,6 +61,9 @@ def transport(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         def request(self, method: str, target: str, body: bytes, headers: dict[str, str]) -> None:
             seen["requests"].append((method, target, json.loads(body), headers))
 
+        def set_tunnel(self, host: str, port: int, headers: dict[str, str]) -> None:
+            seen["tunnel"] = (host, port, headers)
+
         def getresponse(self) -> Any:
             response = io.BytesIO(response_bytes())
             response.status = seen["status"]  # type: ignore[attr-defined]
@@ -71,8 +76,29 @@ def transport(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         raise AssertionError("House request reached the legacy/direct path")
 
     monkeypatch.setattr(http.client, "HTTPConnection", Connection)
+    monkeypatch.setattr(http.client, "HTTPSConnection", Connection)
     monkeypatch.setattr(agent.urllib.request, "urlopen", no_legacy)
     return seen
+
+
+def test_house_reads_uppercase_proxy(monkeypatch, transport):
+    monkeypatch.delenv("http_proxy")
+    monkeypatch.setenv("HTTP_PROXY", "http://synthetic-user:pass@proxy.invalid:3129")
+    assert agent.call_model("synthetic prompt") == ({"assets": {}}, "", "")
+    assert len(transport["requests"]) == 1
+
+
+def test_https_house_uses_authenticated_tunnel(monkeypatch, transport):
+    monkeypatch.setenv("MODEL_ENDPOINT", "https://model.invalid")
+    monkeypatch.setenv("HTTPS_PROXY", "http://synthetic-user:pass@secure-proxy.invalid:3129")
+    assert agent.call_model("synthetic prompt") == ({"assets": {}}, "", "")
+    assert transport["connections"] == [("secure-proxy.invalid", 3129, 60)]
+    host, port, headers = transport["tunnel"]
+    assert (host, port) == ("model.invalid", 443)
+    assert "Proxy-Authorization" in headers
+    _, path, _, request_headers = transport["requests"][0]
+    assert path == "/v1/chat/completions"
+    assert "Proxy-Authorization" not in request_headers
 
 
 @pytest.mark.parametrize("suffix", ["", "/", "/v1", "/v1/"])

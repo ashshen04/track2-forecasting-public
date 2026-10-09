@@ -1,4 +1,6 @@
-# QFBench 2.0 Track-2 reference submission image.
+# ## Executive summary (read this first)
+# Run the unified forecast command with conservative House-model text adjustments.
+# Missing House access keeps the statistical forecast. --no-text disables model calls.
 #
 # Follows the shape the other tracks already use on the shared dev box: the verb is an
 # executable on PATH, CMD is the verb plus --help so `docker run <img>` is self-describing,
@@ -47,6 +49,7 @@ RUN pip install --no-cache-dir \
 
 WORKDIR /work
 COPY qfbench2_track_forecasting /opt/qfbench2_track_forecasting
+COPY baselines /opt/baselines
 ENV PYTHONPATH=/opt
 
 # The verb, as an executable on PATH.

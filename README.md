@@ -252,6 +252,36 @@ separately.
 
 ## Submission format
 
+### Unified forecast entrypoint in this working version
+
+```bash
+.venv/bin/forecast \
+  --panels units/t2-EXAMPLE-ust-curve-1m \
+  --text units/t2-EXAMPLE-ust-curve-1m/text \
+  --asof 2024-06-28 --out /private/tmp/t2-unified/output/forecast.parquet
+```
+
+The `forecast` command and Docker image now use the same entrypoint. It generates
+1,000 joint draws by default, or more when the card requires them. It then attempts
+one House-model call with conservative text adjustments. The numerical engine
+remains in `qfbench2_track_forecasting/cli.py`; the text module is reused from
+`baselines/reasoning_agent.py` and included in the installed package and image.
+
+Add `--no-text` to run the identical statistical model without reading documents or
+calling a model. This is a text ablation: a comparison with the text component removed.
+Keep the seed and draw count the same when comparing the two modes.
+
+The default entrypoint uses only the injected House configuration. It does not use
+`MODEL_API_KEY`. Missing House variables, `QFBENCH_NETWORK=none`, or an unsuccessful
+model request leaves the statistical forecast unchanged. The output metadata reports
+`reasoning_applied`, `reasoning_skipped_reason`, `text_policy`, and `text_adjustments`.
+The local fallback is not evidence that a real House request succeeded.
+
+Text shifts are capped at half the longest-horizon standard deviation. Spread
+multipliers are limited to [1, 1.5]. A nonblank explanation and supplied document IDs
+are required. These bounds are experimental; citation checks do not establish that
+the document supports the claim. See [the text-mode details](baselines/README.md#optional-conservative-text-experiment).
+
 ### The `forecast` verb
 
 Your Docker agent must implement:

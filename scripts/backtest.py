@@ -26,7 +26,7 @@ sys.path.insert(0, str(ROOT))
 
 from baselines.base import ForecastRequest  # noqa: E402
 from baselines.theta_arima import ThetaARIMABaseline  # noqa: E402
-from qfbench2_track_forecasting.cli import _draw  # noqa: E402
+from qfbench2_track_forecasting.cli import EWMA_HALFLIFE, _draw  # noqa: E402
 from qfbench2_track_forecasting.grid import grid_from_card  # noqa: E402
 from qfbench2_track_forecasting.normalization import NormalizationMode  # noqa: E402
 from qfbench2_track_forecasting.scoring import _score  # noqa: E402
@@ -48,10 +48,11 @@ def forecast_samples(name, panels, origin, grid, n_draws, target_type):
         result = model.forecast(request)
         model.validate_output(result, request)
         samples = result.samples
-    elif name in ('reference', 'reference-shuffled'):
+    elif name in ('reference', 'reference-shuffled', 'reference-ewma'):
         try:
             samples, _ = _draw(history, assets, horizons, asof, n_draws, 1,
-                               target_type=target_type)
+                               target_type=target_type,
+                               volatility='ewma' if name == 'reference-ewma' else 'equal')
         except SystemExit as exc:
             raise ValueError(f'Reference forecaster refused: {exc}') from exc
         if name == 'reference-shuffled':
@@ -186,7 +187,7 @@ def main(argv=None):
     parser.add_argument('--folds', type=int, default=3, help='Maximum holdouts per unit')
     parser.add_argument('--min-history', type=int, default=63, help='Minimum complete history dates')
     parser.add_argument('--n-draws', type=int, default=1000)
-    parser.add_argument('--models', nargs='+', choices=['scaffold', 'reference', 'reference-shuffled'], default=['scaffold'])
+    parser.add_argument('--models', nargs='+', choices=['scaffold', 'reference', 'reference-shuffled', 'reference-ewma'], default=['scaffold'])
     parser.add_argument('--include', nargs='+', help='Exact unit names; optional fixed experiment subset')
     args = parser.parse_args(argv)
     if args.folds < 1 or args.min_history < 31 or args.n_draws < 200:
@@ -220,6 +221,13 @@ def main(argv=None):
     summary = {'description': 'Raw historical diagnostics, not official scores or admissibility checks.',
                'created_utc': datetime.now(timezone.utc).isoformat(), 'common_version': version('qfbench2-common'),
                'models': args.models, 'seed': 1, 'text_used': False,
+               'volatility_comparison': {
+                   'reference': 'sample standard deviation; equal weights',
+                   'reference-ewma': 'EWMA standard deviation; bias corrected',
+                   'ewma_halflife_observations': EWMA_HALFLIFE,
+                   'window_observations': 120,
+                   'drift_and_correlation': 'unchanged equal-weight estimates',
+               },
                'implementation_sha256': {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
                    for p in [Path(__file__), ROOT / 'baselines/base.py', ROOT / 'baselines/theta_arima.py',
                              ROOT / 'qfbench2_track_forecasting/cli.py', ROOT / 'qfbench2_track_forecasting/scoring.py']},
@@ -258,6 +266,23 @@ def main(argv=None):
             a = r['mean_by_model']['reference']['composite']
             b = r['mean_by_model']['reference-shuffled']['composite']
             lines.append(f"| {r['unit']} | {a:.6g} | {b:.6g} | {a-b:+.6g} |")
+    if set(args.models) == {'reference', 'reference-ewma'}:
+        lines += ['', '## Volatility comparison', '',
+                  'Only standard deviations change. Drift, correlations, input windows, seeds and origins match.',
+                  f'EWMA half-life is fixed at {EWMA_HALFLIFE:g} observations; no text is used.',
+                  'Negative EWMA-minus-current means EWMA is better. Percentages compare within a unit only.',
+                  'This is development evidence, not an independent validation or an official normalized score.', '',
+                  '| Unit | Current | EWMA | Difference | Change | EWMA better folds |',
+                  '|---|---:|---:|---:|---:|---:|']
+        for r in results:
+            if r['status'] != 'completed':
+                continue
+            a = r['mean_by_model']['reference']['composite']
+            b = r['mean_by_model']['reference-ewma']['composite']
+            change = f'{100 * (b / a - 1):+.2f}%' if a > 0 else 'n/a'
+            wins = sum(f['model_scores']['reference-ewma']['composite'] <
+                       f['model_scores']['reference']['composite'] for f in r['folds'])
+            lines.append(f"| {r['unit']} | {a:.6g} | {b:.6g} | {b-a:+.6g} | {change} | {wins}/{len(r['folds'])} |")
     (out / 'report.md').write_text('\n'.join(lines) + '\n')
     print(f'Results: {out}\n{counts}')
     return 1 if counts.get('failed') or not counts.get('completed') else 0
