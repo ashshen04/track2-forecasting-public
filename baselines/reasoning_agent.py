@@ -91,6 +91,7 @@ import json
 import math
 import os
 import pathlib
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -121,7 +122,53 @@ _RESPONSE_BYTES = 1024 * 1024
 
 
 # --------------------------------------------------------------------------- corpus
-def read_corpus(text_dir: pathlib.Path, asof: str) -> tuple[list[dict[str, Any]], int, int]:
+_POLICY_TERMS = re.compile(
+    r"\b(?:policy rates?|interest rates?|rate cuts?|rate hikes?|inflation expectations?|"
+    r"asset purchases?|quantitative easing|yield curve|forward guidance|accommodative|"
+    r"monetary policy|exchange rates?|foreign exchange|intervention|liquidity|funding|"
+    r"payrolls|consumer prices?)\b", re.IGNORECASE,
+)
+
+
+def document_excerpt(text: str, policy: str = "head") -> str:
+    """Keep the header and verbatim policy windows within the existing character budget.
+
+    Example: a rate-policy paragraph after a long introduction can reach the model.
+    Windows are selected by fixed keyword counts, never by forecast outcomes. The
+    existing head-only policy is the default; relevant excerpts are experimental.
+    """
+    if policy not in ("head", "relevant"):
+        raise ValueError("Unknown document excerpt policy")
+    if policy == "head" or len(text) <= _MAX_DOC_CHARS:
+        return text[:_MAX_DOC_CHARS]
+    prefix = 1500
+    windows = []
+    for match in _POLICY_TERMS.finditer(text):
+        if match.start() < prefix:
+            continue
+        start = max(prefix, match.start() - 400)
+        end = min(len(text), start + 1000)
+        score = len(_POLICY_TERMS.findall(text[start:end]))
+        windows.append((score, start, end))
+    if not windows:
+        return text[:_MAX_DOC_CHARS]
+    selected: list[tuple[int, int]] = []
+    for _, start, end in sorted(windows, key=lambda w: (-w[0], w[1])):
+        if any(start < previous_end and end > previous_start
+               for previous_start, previous_end in selected):
+            continue
+        selected.append((start, end))
+        if len(selected) == 4:
+            break
+    excerpt = text[:prefix]
+    for start, end in sorted(selected):
+        excerpt += f"\n[Excerpt from character {start}]\n" + text[start:end]
+    return excerpt[:_MAX_DOC_CHARS]
+
+
+def read_corpus(
+    text_dir: pathlib.Path, asof: str, *, excerpt_policy: str = "head",
+) -> tuple[list[dict[str, Any]], int, int]:
     """Documents dated at or before `asof`, newest first.
 
     Returns `(kept, excluded_by_date, dropped_by_prompt_budget)`. The two counts are reported
@@ -155,7 +202,8 @@ def read_corpus(text_dir: pathlib.Path, asof: str) -> tuple[list[dict[str, Any]]
                 "timestamp": ts,
                 "doc_type": doc.get("doc_type"),
                 "source": doc.get("source"),
-                "text": path.read_text(encoding="utf-8", errors="replace")[:_MAX_DOC_CHARS],
+                "text": document_excerpt(
+                    path.read_text(encoding="utf-8", errors="replace"), excerpt_policy),
             }
         )
     kept.sort(key=lambda d: str(d["timestamp"]), reverse=True)
@@ -483,8 +531,9 @@ def apply_adjustment(
         if abs(shift) > ceiling:
             note += f"drift clamped from {shift:+.6g} to magnitude {ceiling:.6g} ({drift_bound} sd)"
             shift = math.copysign(ceiling, shift)
-        centre = out[:, i, :].mean(axis=0, keepdims=True)
-        out[:, i, :] = centre + (out[:, i, :] - centre) * vol + shift
+        if vol != 1.0 or shift != 0.0:
+            centre = out[:, i, :].mean(axis=0, keepdims=True)
+            out[:, i, :] = centre + (out[:, i, :] - centre) * vol + shift
         applied[a] = {
             "drift_bp": drift_bp,
             "vol_scale": vol,
@@ -511,13 +560,33 @@ def main(argv: list[str] | None = None, *, house_only: bool = False) -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--conservative", action="store_true",
                     help="Require document citations; cap shift at 0.5 sd and volatility at 1-1.5.")
+    ap.add_argument("--text-policy", choices=("original", "conservative", "structured"))
+    ap.add_argument('--statistical-model', choices=('gaussian', 'adaptive-gaussian', 'student-t', 'adaptive-t', 'historical-t'), default='gaussian')
+    ap.add_argument("--text-cache", type=pathlib.Path)
+    ap.add_argument("--text-scale", type=float, default=1.)
+    ap.add_argument("--monthly-trend", choices=("auto", "none", "recent", "half", "damped"), default="auto")
     a = ap.parse_args(argv)
+    policy = a.text_policy or ("conservative" if a.conservative else "original")
+    a.conservative = policy == "conservative"
+    structured = policy == "structured"
+    if not math.isfinite(a.text_scale) or not 0 <= a.text_scale <= 1:
+        ap.error("--text-scale must be finite and between zero and one")
+    if a.text_scale != 1. and not structured:
+        ap.error("--text-scale requires --text-policy structured")
+    if a.text_cache is not None and not structured:
+        ap.error("--text-cache requires --text-policy structured")
 
     # The statistical half, imported rather than reimplemented.
     from qfbench2_track_forecasting.cli import _draw, _monthly_inputs, _read_panels
     from qfbench2_track_forecasting.horizons import HorizonMetadataError
 
     card = tomllib.loads(pathlib.Path(a.card).read_text(encoding="utf-8"))
+    from baselines.monthly_trend import resolve_cpi_policy
+    requested_monthly_trend = a.monthly_trend
+    try:
+        a.monthly_trend = resolve_cpi_policy(card, a.monthly_trend)
+    except ValueError as exc:
+        ap.error(str(exc))
     t = card["targets"]
     assets, horizons = list(t["asset_ids"]), [int(h) for h in t["horizons"]]
     panels = _read_panels(pathlib.Path(a.panels))
@@ -525,6 +594,8 @@ def main(argv: list[str] | None = None, *, house_only: bool = False) -> int:
         panel_steps = _monthly_inputs(panels, card, pathlib.Path(a.card), a.asof)
     except HorizonMetadataError as exc:
         raise SystemExit(str(exc)) from None
+    if requested_monthly_trend == 'auto' and panel_steps is None:
+        a.monthly_trend = 'none'
     # `_draw` returns (samples, meta); meta already carries the as-of level per asset, so the
     # drift below is expressed against the same number the statistical half used rather than a
     # second, independently derived one.
@@ -545,6 +616,8 @@ def main(argv: list[str] | None = None, *, house_only: bool = False) -> int:
         a.seed,
         target_type=t["target_type"],
         panel_steps=panel_steps,
+        monthly_trend=a.monthly_trend,
+        statistical_model=a.statistical_model,
     )
     last = {x: float(draw_meta["last"][x]) for x in assets}
     # Monthly widths come from the resolved observation periods, including publication lag.
@@ -552,12 +625,29 @@ def main(argv: list[str] | None = None, *, house_only: bool = False) -> int:
     monthly = draw_meta.get("step_unit") == "month"
     sd_h = (
         {x: max(draw_meta["horizon_sd"][x].values()) for x in assets}
-        if monthly
+        if monthly or draw_meta.get('horizon_sd')
         else {x: float(draw_meta["daily_sd"][x]) * math.sqrt(max(horizons)) for x in assets}
     )
 
-    docs, excluded, truncated = read_corpus(pathlib.Path(a.text), a.asof)
-    if house_only and os.environ.get("QFBENCH_NETWORK", "").lower() == "none":
+    docs, excluded, truncated = read_corpus(
+        pathlib.Path(a.text), a.asof, excerpt_policy="relevant" if structured else "head",
+    )
+    analysis_audit: dict[str, Any] = {}
+    reply_cache = None
+    if structured:
+        from baselines.directional_text import apply_directional
+        from baselines.evidence_analysis import (
+            ANALYSIS_VERSION, PromptReplyCache, analysis_prompt, resolve_analysis,
+        )
+
+        context = {x: {"value_unit": t.get("value_unit", "unknown")} for x in assets}
+    if monthly and a.monthly_trend != 'none':
+        parsed, reason, trace = None, "monthly CPI statistical trend; no text correction applied", ""
+    elif structured and a.text_scale == 0:
+        parsed, reason, trace = None, "structured text scale is zero; statistical forecast retained", ""
+    elif structured and monthly:
+        parsed, reason, trace = None, "structured text is daily-only; monthly statistical forecast retained", ""
+    elif house_only and os.environ.get("QFBENCH_NETWORK", "").lower() == "none":
         parsed, reason, trace = None, "QFBENCH_NETWORK=none; no model call attempted", ""
     elif house_only and any(
         not os.environ.get(name, "").strip()
@@ -567,8 +657,13 @@ def main(argv: list[str] | None = None, *, house_only: bool = False) -> int:
     elif not docs:
         parsed, reason, trace = None, "no corpus document is dated at or before the as-of date", ""
     else:
-        parsed, reason, trace = call_model(
-            build_prompt(
+        provider = call_model
+        if structured and a.text_cache is not None:
+            reply_cache = PromptReplyCache(a.text_cache, call_model)
+            provider = reply_cache
+        parsed, reason, trace = provider(
+            analysis_prompt(assets, horizons, a.asof, t["target_type"], docs, context)
+            if structured else build_prompt(
                 assets,
                 horizons,
                 a.asof,
@@ -586,22 +681,42 @@ def main(argv: list[str] | None = None, *, house_only: bool = False) -> int:
     if parsed is None:
         reasoning_applied = False
     else:
-        adjusted, applied, matched = apply_adjustment(
-            samples, assets, last, sd_h, parsed, target_type=t["target_type"],
-            conservative=a.conservative,
-            valid_doc_ids={str(d["doc_id"]) for d in docs},
-        )
+        if structured:
+            converted, analysis_audit = resolve_analysis(
+                parsed, assets, horizons, a.asof, t["target_type"], docs, context,
+            )
+            adjusted, applied, matched = apply_directional(
+                samples, assets, horizons, sd_h, converted, docs, evidence_format="span",
+                adjustment_scale=a.text_scale,
+            )
+        else:
+            adjusted, applied, matched = apply_adjustment(
+                samples, assets, last, sd_h, parsed, target_type=t["target_type"],
+                conservative=a.conservative,
+                valid_doc_ids={str(d["doc_id"]) for d in docs},
+            )
         if matched == 0:
             keys = sorted(parsed)[:8] if isinstance(parsed, dict) else []
             reasoning_applied = False
             reason = (
                 "no asset adjustment passed evidence and numeric checks"
-                if a.conservative else
+                if a.conservative or structured else
                 f"reply named none of the requested assets {assets}; its top-level keys were {keys}"
             )
         else:
+            reasoning_applied = not np.array_equal(samples, adjusted) if structured else True
             samples = adjusted
-            reasoning_applied, reason = True, ""
+            reason = "" if reasoning_applied else "validated structured evidence; no directional correction"
+
+    method = (
+        "joint gaussian random walk + cited causal drivers with bounded daily centre shifts"
+        if structured and reasoning_applied else
+        "joint gaussian random walk + model-supplied drift_bp/vol_scale"
+        if reasoning_applied else
+        "joint gaussian random walk, unadjusted (reasoning skipped or abstained)"
+    )
+    if draw_meta.get('statistical_model', 'gaussian') != 'gaussian':
+        method = method.replace('joint gaussian random walk', f"joint {draw_meta['statistical_model']} forecast")
 
     out = pathlib.Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -628,16 +743,19 @@ def main(argv: list[str] | None = None, *, house_only: bool = False) -> int:
                 # whose own object is open, so both are valid sidecar content -- verified by
                 # running the emitted file through g1_schema.
                 "reasoning_applied": reasoning_applied,
-                "text_policy": "conservative-v1" if a.conservative else "original",
+                "text_policy": ANALYSIS_VERSION if structured else "conservative-v1" if a.conservative else "original",
+                "text_scale": a.text_scale if structured else None,
+                "monthly_trend": draw_meta.get("monthly_trend"),
+                "monthly_centre_shifts": draw_meta.get("centre_shifts"),
+                'statistical_model': draw_meta.get('statistical_model', 'gaussian'),
+                'distribution_parameters': draw_meta.get('distribution_parameters'),
                 "text_adjustments": applied,
+                "analysis_audit": analysis_audit,
+                "text_cache_hits": reply_cache.hits if reply_cache else 0,
                 "reasoning_skipped_reason": reason if not reasoning_applied else "",
                 "rationale": {
                     "file": "forecast_rationale.md",
-                    "method": (
-                        "joint gaussian random walk + model-supplied drift_bp/vol_scale"
-                        if reasoning_applied
-                        else "joint gaussian random walk, unadjusted (reasoning skipped)"
-                    ),
+                    "method": method,
                     "documents_read": len(docs),
                     "documents_excluded_by_cutoff": excluded,
                     "documents_over_prompt_budget": truncated,
@@ -656,7 +774,7 @@ def main(argv: list[str] | None = None, *, house_only: bool = False) -> int:
                 "",
                 "## Statistical half",
                 "",
-                "Joint Gaussian random walk from `qfbench2_track_forecasting.cli._draw`:",
+                f"Joint {draw_meta.get('statistical_model', 'gaussian')} forecast from `qfbench2_track_forecasting.cli._draw`:",
                 (
                     "Zero anchor, mean daily log-return drift, and correlated "
                     "log(1 + panel value) innovations;"
@@ -669,10 +787,13 @@ def main(argv: list[str] | None = None, *, house_only: bool = False) -> int:
                 ),
                 "shape is preserved rather than assembled from independent marginals.",
                 *(
-                    ["Monthly steps include the publication lag of the last available observation."]
+                    ["Monthly steps include the publication lag of the last available observation.",
+                     f"Monthly statistical trend: {draw_meta['monthly_trend']['policy']}; "
+                     f"centre shifts: {draw_meta['centre_shifts']}."]
                     if monthly else
-                    ["Later horizons reuse earlier shocks and add independent future increments."]
+                    ["Later horizons reuse earlier shocks. New increments are conditionally independent given the forecast's latent risk scale."]
                 ),
+                *([f"Fixed distribution parameters (not fitted): {draw_meta['distribution_parameters']}"] if draw_meta.get('distribution_parameters') else []),
                 *(
                     [
                         "",
@@ -698,11 +819,22 @@ def main(argv: list[str] | None = None, *, house_only: bool = False) -> int:
                 f"**{truncated}**",
                 f"- assets accepted from the reply: **{matched} of {len(assets)}**",
                 f"- conservative policy: **{a.conservative}**",
+                f"- text policy: **{policy}**",
                 "- citations identify supplied documents; their semantic support is not verified.",
                 f"- adjustment applied: **{reasoning_applied}**",
                 *([f"- skipped because: {reason}"] if not reasoning_applied else []),
                 "",
                 *(
+                    [
+                        "| asset | status | longest-horizon shift | mechanism |",
+                        "|---|---|---:|---|",
+                    ]
+                    + [
+                        f"| {k} | {v['status']} | {v.get('longest_horizon_shift', 0):+.6g} | "
+                        f"{v.get('mechanism', 'Evidence validation failed')} |"
+                        for k, v in applied.items()
+                    ]
+                    if structured and applied else
                     [
                         "| asset | drift_bp | vol_scale | shift | because | note |",
                         "|---|---|---|---|---|---|",

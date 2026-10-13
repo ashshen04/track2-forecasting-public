@@ -1,5 +1,5 @@
 # ## Executive summary (read this first)
-# Run the unified forecast command with conservative House-model text adjustments.
+# Run the unified forecast command with structured House-model text adjustments.
 # Missing House access keeps the statistical forecast. --no-text disables model calls.
 #
 # Follows the shape the other tracks already use on the shared dev box: the verb is an
@@ -50,10 +50,10 @@ RUN pip install --no-cache-dir \
 WORKDIR /work
 COPY qfbench2_track_forecasting /opt/qfbench2_track_forecasting
 COPY baselines /opt/baselines
-ENV PYTHONPATH=/opt
+ENV PYTHONPATH=/opt MODEL_MAX_TOKENS=4000 MODEL_THINKING=off
 
 # The verb, as an executable on PATH.
-RUN printf '#!/bin/sh\nexec python3 -m qfbench2_track_forecasting.cli "$@"\n' \
+RUN printf '#!/bin/sh\nexec python3 -m qfbench2_track_forecasting.cli --text-policy structured "$@"\n' \
       > /usr/local/bin/forecast \
  && chmod +x /usr/local/bin/forecast
 

@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 
 from baselines.base import ForecastRequest  # noqa: E402
 from baselines.theta_arima import ThetaARIMABaseline  # noqa: E402
+from baselines.mean_reversion import draw_mean_reversion  # noqa: E402
 from qfbench2_track_forecasting.cli import EWMA_HALFLIFE, _draw  # noqa: E402
 from qfbench2_track_forecasting.grid import grid_from_card  # noqa: E402
 from qfbench2_track_forecasting.normalization import NormalizationMode  # noqa: E402
@@ -35,6 +36,91 @@ from qfbench2_track_forecasting.targets import log_return_steps  # noqa: E402
 
 class SkipUnit(ValueError):
     """The available inputs cannot support this historical experiment."""
+
+
+DRIFT_MODELS = {
+    'reference-drift-zero': 0.0,
+    'reference-drift-half': 0.5,
+    'reference-drift-full': 1.0,
+}
+WIDTH_MODELS = {'reference-width-08': 0.8, 'reference-width-12': 1.2}
+COMPONENTS = ('marginal', 'joint', 'tail', 'composite')
+
+
+def calibration_validation(folds, selection_folds, required_folds, model_names):
+    """Select on older folds only, then evaluate the locked choice on newer folds.
+
+    Selection is local to one unit, not a learned policy for unseen cards.
+    A tie keeps the existing reference model. Incomplete runs claim no validation.
+    """
+    if len(folds) != required_folds:
+        return {'status': 'insufficient_folds', 'required': required_folds,
+                'available': len(folds)}
+    older, newer = folds[:selection_folds], folds[selection_folds:]
+    names = ['reference', *model_names]
+    means = {name: float(np.mean([f['model_scores'][name]['composite'] for f in older]))
+             for name in names}
+    selected = min(names, key=means.get)
+    evaluation = {}
+    for name in names:
+        scores = {component: float(np.mean([f['model_scores'][name][component] for f in newer]))
+                  for component in COMPONENTS}
+        base = {component: float(np.mean([f['model_scores']['reference'][component] for f in newer]))
+                for component in COMPONENTS}
+        evaluation[name] = {
+            'mean_components': scores,
+            'change_percent': {component: 100 * (scores[component] / base[component] - 1)
+                               if base[component] > 0 else None for component in COMPONENTS},
+            'wins': sum(f['model_scores'][name]['composite'] <
+                        f['model_scores']['reference']['composite'] for f in newer),
+            'folds': len(newer),
+        }
+    return {'status': 'completed', 'selected_model': selected,
+            'selection_origins': [f['asof'] for f in older],
+            'validation_origins': [f['asof'] for f in newer],
+            'selection_mean_composite': means,
+            'validation_by_model': evaluation, 'validation': evaluation[selected]}
+
+
+def drift_validation(folds, selection_folds, required_folds):
+    return calibration_validation(folds, selection_folds, required_folds, DRIFT_MODELS)
+
+
+def width_validation(folds, selection_folds, required_folds):
+    return calibration_validation(folds, selection_folds, required_folds, WIDTH_MODELS)
+
+
+def load_excluded_intervals(paths):
+    """Merge previously scored (origin, final target] intervals by shared asset."""
+    intervals = {}
+    for path in paths:
+        summary = json.loads(path.read_text())
+        if not isinstance(summary.get('units'), list) or not summary['units']:
+            raise ValueError('Exclusion summary must contain historical units')
+        for unit in summary['units']:
+            for fold in unit.get('folds', []):
+                start = pd.Timestamp(fold['asof'])
+                end = max(pd.Timestamp(date) for date in fold['target_dates'])
+                if end <= start:
+                    raise ValueError('Exclusion interval must end after its origin')
+                for asset in unit['assets']:
+                    intervals.setdefault(asset, []).append((start, end))
+    merged = {}
+    for asset, ranges in intervals.items():
+        merged[asset] = []
+        for start, end in sorted(ranges):
+            if merged[asset] and start <= merged[asset][-1][1]:
+                merged[asset][-1] = (merged[asset][-1][0], max(end, merged[asset][-1][1]))
+            else:
+                merged[asset].append((start, end))
+    if paths and not merged:
+        raise ValueError('Exclusion summary contains no historical holdouts')
+    return merged
+
+
+def overlaps_excluded(origin, end, assets, excluded):
+    return any(origin < past_end and end > past_origin
+               for asset in assets for past_origin, past_end in excluded.get(asset, []))
 
 
 def forecast_samples(name, panels, origin, grid, n_draws, target_type):
@@ -48,11 +134,22 @@ def forecast_samples(name, panels, origin, grid, n_draws, target_type):
         result = model.forecast(request)
         model.validate_output(result, request)
         samples = result.samples
-    elif name in ('reference', 'reference-shuffled', 'reference-ewma'):
+    elif name in ('reference-mean-reversion', 'reference-mean-reversion-centre'):
+        if target_type == 'log_return':
+            samples, _ = _draw(history, assets, horizons, asof, n_draws, 1,
+                               target_type=target_type)
+        else:
+            samples, _ = draw_mean_reversion(history, assets, horizons, asof, n_draws, 1,
+                centre_only=name == 'reference-mean-reversion-centre')
+    elif (name in ('reference', 'reference-shuffled', 'reference-ewma')
+          or name in DRIFT_MODELS or name in WIDTH_MODELS or name == 'reference-bootstrap'):
         try:
             samples, _ = _draw(history, assets, horizons, asof, n_draws, 1,
                                target_type=target_type,
-                               volatility='ewma' if name == 'reference-ewma' else 'equal')
+                               volatility='ewma' if name == 'reference-ewma' else 'equal',
+                               drift_scale=DRIFT_MODELS.get(name),
+                               width_scale=WIDTH_MODELS.get(name, 1.0),
+                               innovation='bootstrap' if name == 'reference-bootstrap' else 'gaussian')
         except SystemExit as exc:
             raise ValueError(f'Reference forecaster refused: {exc}') from exc
         if name == 'reference-shuffled':
@@ -144,6 +241,9 @@ def run_unit(unit, args):
         end = origin + pd.offsets.BDay(max_h)
         if end > cutoff or (next_end is not None and end > next_end):
             continue
+        if overlaps_excluded(origin, end, grid.assets, getattr(args, '_excluded_intervals', {})):
+            rejected['Overlaps a previously inspected holdout for a shared asset'] += 1
+            continue
         try:
             truth, dates = holdout(wide, origin, grid.horizons, target_type)
         except SkipUnit as exc:
@@ -168,7 +268,7 @@ def run_unit(unit, args):
     warnings = ['Fixed-snapshot retrospective experiment; historical publication vintages not verified.']
     if 'unverified' in manifest.lower() or 'synthetic' in manifest.lower():
         warnings.append('Manifest flags synthetic or unverified provenance; not evidence of market skill.')
-    return {'status': 'completed', 'unit': unit.name, 'target_type': target_type,
+    result = {'status': 'completed', 'unit': unit.name, 'target_type': target_type,
             'assets': list(grid.assets), 'horizons': list(grid.horizons),
             'source_sha256': hashes, 'warnings': warnings, 'rejected_origins': dict(rejected),
             'mean_by_model': {name: {component: float(np.mean([
@@ -177,6 +277,12 @@ def run_unit(unit, args):
                 for name in args.models},
             'folds': list(reversed(folds)), 'mean_raw_composite': float(np.mean(
                 [f['scores']['composite'] for f in folds]))}
+    if getattr(args, 'selection_folds', None) is not None:
+        width = set(WIDTH_MODELS).issubset(args.models)
+        result['width_validation' if width else 'drift_validation'] = (
+            width_validation if width else drift_validation)(
+                result['folds'], args.selection_folds, args.folds)
+    return result
 
 
 def main(argv=None):
@@ -187,15 +293,34 @@ def main(argv=None):
     parser.add_argument('--folds', type=int, default=3, help='Maximum holdouts per unit')
     parser.add_argument('--min-history', type=int, default=63, help='Minimum complete history dates')
     parser.add_argument('--n-draws', type=int, default=1000)
-    parser.add_argument('--models', nargs='+', choices=['scaffold', 'reference', 'reference-shuffled', 'reference-ewma'], default=['scaffold'])
+    parser.add_argument('--models', nargs='+', choices=[
+        'scaffold', 'reference', 'reference-shuffled', 'reference-ewma', *DRIFT_MODELS, *WIDTH_MODELS,
+        'reference-bootstrap', 'reference-mean-reversion', 'reference-mean-reversion-centre'],
+        default=['scaffold'])
+    parser.add_argument('--selection-folds', type=int, help=(
+        'Choose a calibration using this many oldest folds; validate on remaining newer folds. '
+        'Requires reference and either all drift models or both width models.'))
+    parser.add_argument('--exclude-intervals-from', type=Path, nargs='+', default=[],
+                        help='Previous summary.json files: exclude overlapping target intervals by shared asset')
     parser.add_argument('--include', nargs='+', help='Exact unit names; optional fixed experiment subset')
     args = parser.parse_args(argv)
     if args.folds < 1 or args.min_history < 31 or args.n_draws < 200:
         parser.error('Require folds >= 1, min-history >= 31, n-draws >= 200')
+    if args.selection_folds is not None:
+        if not 1 <= args.selection_folds < args.folds:
+            parser.error('Require 1 <= selection-folds < folds')
+        drift = set(DRIFT_MODELS).issubset(args.models)
+        width = set(WIDTH_MODELS).issubset(args.models)
+        if 'reference' not in args.models or drift == width:
+            parser.error('Selection requires reference and one complete drift or width candidate set')
     try:
         out = outside_repo(args.out)
     except ValueError as exc:
         parser.error(str(exc))
+    try:
+        args._excluded_intervals = load_excluded_intervals(args.exclude_intervals_from)
+    except (ValueError, OSError, KeyError) as exc:
+        parser.error(f'Invalid exclusion summary: {type(exc).__name__}')
     units = sorted(p for p in args.units.glob(args.pattern) if (p / 'card.toml').is_file())
     if args.include:
         missing = set(args.include) - {p.name for p in units}
@@ -221,6 +346,29 @@ def main(argv=None):
     summary = {'description': 'Raw historical diagnostics, not official scores or admissibility checks.',
                'created_utc': datetime.now(timezone.utc).isoformat(), 'common_version': version('qfbench2-common'),
                'models': args.models, 'seed': 1, 'text_used': False,
+               'mean_reversion_comparison': {
+                   'fit': '120 adjacent business-day pairs; persistence shrunk halfway to random walk',
+                   'centre_variant': 'same reference innovations, fitted nonlinear centre only',
+                   'full_variant': 'joint Gaussian residuals propagated daily through fitted persistence',
+                   'return_targets': 'unchanged reference; no reversion of daily return levels',
+                   'monthly': 'unsupported; skipped',
+               },
+               'innovation_comparison': {
+                   'reference': 'Gaussian correlated increments',
+                   'reference-bootstrap': 'Whole centred daily vectors resampled with replacement',
+                   'variance': 'Empirical population covariance corrected to sample covariance',
+                   'window_observations': 120, 'monthly': 'unsupported; skipped',
+               },
+               'width_comparison': {'reference': 1.0, **WIDTH_MODELS,
+                                    'centre_and_correlation': 'unchanged; only innovation standard deviations scale'},
+               'exclusion_sha256': {str(p.resolve()): hashlib.sha256(p.read_bytes()).hexdigest()
+                                    for p in args.exclude_intervals_from},
+               'drift_comparison': {
+                   'scales': DRIFT_MODELS, 'window_observations': 120,
+                   'selection': 'per-unit oldest folds only; ties keep reference',
+                   'validation': 'newer non-overlapping folds; not independent across units',
+                   'monthly': 'unsupported; skipped',
+               },
                'volatility_comparison': {
                    'reference': 'sample standard deviation; equal weights',
                    'reference-ewma': 'EWMA standard deviation; bias corrected',
@@ -230,9 +378,12 @@ def main(argv=None):
                },
                'implementation_sha256': {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
                    for p in [Path(__file__), ROOT / 'baselines/base.py', ROOT / 'baselines/theta_arima.py',
+                             ROOT / 'baselines/mean_reversion.py',
                              ROOT / 'qfbench2_track_forecasting/cli.py', ROOT / 'qfbench2_track_forecasting/scoring.py']},
                'calendar': 'Monday-Friday; missing endpoints or daily return rows are rejected',
-               'settings': {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+               'settings': {k: str(v) if isinstance(v, Path) else
+                            [str(x) if isinstance(x, Path) else x for x in v] if isinstance(v, list)
+                            else v for k, v in vars(args).items() if not k.startswith('_')},
                'counts': counts, 'units': results}
     (out / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     lines = ['## Executive summary (read this first)', '',
@@ -283,6 +434,42 @@ def main(argv=None):
             wins = sum(f['model_scores']['reference-ewma']['composite'] <
                        f['model_scores']['reference']['composite'] for f in r['folds'])
             lines.append(f"| {r['unit']} | {a:.6g} | {b:.6g} | {b-a:+.6g} | {change} | {wins}/{len(r['folds'])} |")
+    if args.exclude_intervals_from:
+        lines += ['', 'Previously inspected target intervals are excluded for every shared asset,',
+                  'including intervals recorded under other unit names. Training history may overlap.']
+    if set(args.models) == {'reference', 'reference-bootstrap'}:
+        lines += ['', '## Empirical innovation comparison', '',
+                  'Bootstrap resamples complete centred daily change vectors with replacement.',
+                  'The theoretical centre and sample covariance match the Gaussian reference.',
+                  'Historical skew and cross-asset tail dependence can differ. Monthly tasks are skipped.',
+                  'Raw fold scores alone do not establish an improvement or a deployment policy.']
+    if args.selection_folds is not None:
+        width = set(WIDTH_MODELS).issubset(args.models)
+        description = ('Width scales are 0.8, 1.0 and 1.2; the theoretical centre is unchanged.' if width else
+                       'Trend means the historical mean daily change or log return times the horizon.')
+        lines += ['', '## Chronological width validation' if width else '## Chronological drift validation', '',
+                  description,
+                  ('Only innovation scale changes. Drift, correlation, seeds and text match.' if width else
+                   'Only the centre changes. Spread, correlation, innovations and text match.'),
+                  'Each unit selects using its oldest folds, then locks the choice for newer folds.',
+                  'Negative percentage change favours the selected model; ties keep reference.',
+                  'This is a per-unit diagnostic, not a deployment policy or independent evidence across units.',
+                  'Monthly units and incomplete fold sets do not establish validation.', '',
+                  '| Unit | Selected on older folds | Newer composite change | Marginal | Joint | Tail | Wins |',
+                  '|---|---|---:|---:|---:|---:|---:|']
+        for r in results:
+            if r['status'] != 'completed':
+                continue
+            experiment = r['width_validation' if width else 'drift_validation']
+            if experiment['status'] != 'completed':
+                lines.append(f"| {r['unit']} | insufficient folds | — | — | — | — | — |")
+                continue
+            val = experiment['validation']
+            change = val['change_percent']
+            cells = [f'{change[c]:+.2f}%' if change[c] is not None else 'n/a'
+                     for c in ('composite', 'marginal', 'joint', 'tail')]
+            lines.append(f"| {r['unit']} | {experiment['selected_model']} | " +
+                         ' | '.join(cells) + f" | {val['wins']}/{val['folds']} |")
     (out / 'report.md').write_text('\n'.join(lines) + '\n')
     print(f'Results: {out}\n{counts}')
     return 1 if counts.get('failed') or not counts.get('completed') else 0

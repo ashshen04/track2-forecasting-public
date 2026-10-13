@@ -76,6 +76,24 @@ def arguments(unit, out, draws=10000):
     ]
 
 
+def test_structured_monthly_mode_retains_resolved_steps_without_model_call(monthly_unit, tmp_path, monkeypatch):
+    unit, _ = monthly_unit
+    for name in ('MODEL_ENDPOINT', 'MODEL_NAME', 'MODEL_TOKEN'):
+        monkeypatch.setenv(name, 'synthetic')
+    def forbidden_call(prompt):
+        raise AssertionError('Monthly horizon keys must not reach the daily structured policy')
+    monkeypatch.setattr(reasoning_agent, 'call_model', forbidden_call)
+    out = tmp_path / 'structured/forecast.parquet'
+    base = tmp_path / 'base/forecast.parquet'
+    cli.main(arguments(unit, out, 1000) + ['--text-policy', 'structured'])
+    cli.main(arguments(unit, base, 1000) + ['--no-text', '--monthly-trend', 'none'])
+    pd.testing.assert_frame_equal(pd.read_parquet(out), pd.read_parquet(base))
+    meta = json.loads((out.parent / 'forecast_meta.json').read_text())
+    assert meta['horizons'] == [21, 42]
+    assert not meta['reasoning_applied']
+    assert 'daily-only' in meta['reasoning_skipped_reason']
+
+
 def test_cli_retains_keys_and_uses_monthly_spread_from_lagged_anchor(monthly_unit, tmp_path):
     unit, panel = monthly_unit
     out = tmp_path / "out/forecast.parquet"
@@ -91,6 +109,47 @@ def test_cli_retains_keys_and_uses_monthly_spread_from_lagged_anchor(monthly_uni
     rationale = (out.parent / "forecast_rationale.md").read_text().lower()
     assert "monthly steps" in rationale and "publication lag" in rationale
     assert "daily" not in rationale and "business days" not in rationale
+
+
+@pytest.mark.parametrize('entrypoint', [cli.main, reasoning_agent.main])
+def test_opt_in_cpi_trend_reaches_both_formal_entrypoints(monthly_unit, tmp_path, entrypoint):
+    unit, panel = monthly_unit
+    card = unit / 'card.toml'
+    card.write_text(card.read_text() + 'value_unit="cpi_index_1982_84_100"\n')
+    panel['value'] = 100 + np.cumsum(np.tile([1.5, .5], 24))
+    panel.to_parquet(unit / 'monthly.parquet', index=False)
+    base = tmp_path / 'baseline/forecast.parquet'
+    changed = tmp_path / 'trend/forecast.parquet'
+    cli.main(arguments(unit, base, 1000) + ['--no-text', '--monthly-trend', 'none'])
+    entrypoint(arguments(unit, changed, 1000) + ['--text-policy', 'structured', '--monthly-trend', 'half'])
+    before = pd.read_parquet(base); after = pd.read_parquet(changed)
+    for h, months in [(21, 3), (42, 4)]:
+        np.testing.assert_allclose(after.loc[after.horizon == h, 'value'].to_numpy()
+            - before.loc[before.horizon == h, 'value'].to_numpy(), .5 * months)
+    meta = json.loads((changed.parent / 'forecast_meta.json').read_text())
+    assert meta['monthly_trend']['policy'] == 'half'
+    assert not meta['reasoning_applied']
+
+
+@pytest.mark.parametrize('entrypoint', [cli.main, reasoning_agent.main])
+def test_default_cpi_forecast_matches_damped_and_never_calls_model(monthly_unit, tmp_path, monkeypatch, entrypoint):
+    unit, panel = monthly_unit
+    card = unit / 'card.toml'
+    card.write_text(card.read_text() + 'value_unit="cpi_index_1982_84_100"\n')
+    panel['value'] = 100 + np.cumsum(np.tile([1.5, .5], 24))
+    panel.to_parquet(unit / 'monthly.parquet', index=False)
+    for name in ('MODEL_ENDPOINT', 'MODEL_NAME', 'MODEL_TOKEN'):
+        monkeypatch.setenv(name, 'synthetic')
+    def forbidden(prompt):
+        raise AssertionError('Default CPI trend must be statistical only')
+    monkeypatch.setattr(reasoning_agent, 'call_model', forbidden)
+    expected = tmp_path / 'damped/forecast.parquet'
+    actual = tmp_path / 'default/forecast.parquet'
+    cli.main(arguments(unit, expected, 1000) + ['--no-text', '--monthly-trend', 'damped'])
+    entrypoint(arguments(unit, actual, 1000))
+    pd.testing.assert_frame_equal(pd.read_parquet(expected), pd.read_parquet(actual))
+    meta = json.loads((actual.parent / 'forecast_meta.json').read_text())
+    assert meta['monthly_trend']['policy'] == 'damped'
 
 
 def test_same_month_start_end_labels_produce_identical_parquet_bytes(monthly_unit, tmp_path):

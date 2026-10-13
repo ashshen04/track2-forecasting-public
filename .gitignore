@@ -24,6 +24,8 @@ env/
 /model-cache/
 
 # Local scratch
+.env
+.env.*
 *.log
 /out/
 # run_example.sh writes a per-unit output/ dir (forecast.parquet + meta)

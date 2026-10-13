@@ -235,20 +235,57 @@ def _draw(
     target_type: str = "level",
     panel_steps: np.ndarray | None = None,
     volatility: str = "equal",
+    drift_scale: float | None = None,
+    width_scale: float = 1.0,
+    innovation: str = "gaussian",
+    monthly_trend: str = "none",
+    statistical_model: str = "gaussian",
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Joint Gaussian walk, using level changes or daily log returns as steps.
+    """Joint walk, using level changes or daily log returns as steps.
 
     Drawing each asset independently would score badly on purpose: the composite puts 0.3 on the
     joint variogram term precisely to catch marginals that were stapled together. So the shared
     innovation is drawn from the empirical correlation of historical steps. Daily horizons share
     a cumulative path, with marginal sqrt(h) scaling. An explicit monthly step matrix selects paths
     in calendar months, including the panel publication lag.
+
+    Experimental daily drift_scale multiplies the last 120 steps' mean by a number
+    between zero and one, for either target type. None keeps the deployed policy.
+    It changes only the centre, preserving the same innovations and covariance.
+    Experimental daily width_scale multiplies innovation standard deviations.
+    Its default of one preserves the current distribution.
+    Experimental bootstrap innovations resample whole centred daily vectors.
+    They preserve empirical skew and dependence at matched sample covariance.
+    Gaussian innovations remain the default; monthly bootstrap is unsupported.
     """
+    from baselines.adaptive_distribution import MODELS
+    if statistical_model not in MODELS:
+        raise ValueError("Unknown statistical model")
+    if statistical_model != 'gaussian' and (innovation != 'gaussian' or volatility != 'equal' or width_scale != 1. or drift_scale is not None):
+        raise ValueError("Adaptive distributions cannot be combined with other experimental calibrations")
+    if innovation not in ("gaussian", "bootstrap"):
+        raise ValueError("innovation must be gaussian or bootstrap")
+    if innovation == "bootstrap" and (panel_steps is not None or volatility != "equal"):
+        raise ValueError("Bootstrap innovations require daily equal-weight history")
     if volatility not in ("equal", "ewma"):
         raise ValueError("volatility must be equal or ewma")
+    if not np.isfinite(width_scale) or width_scale <= 0:
+        raise ValueError("width_scale must be finite and positive")
+    if width_scale != 1.0 and panel_steps is not None:
+        raise ValueError("Width calibration is an experimental daily-only mode")
     if volatility == "ewma" and panel_steps is not None:
         raise ValueError("EWMA volatility is an experimental daily-only mode")
+    if drift_scale is not None:
+        if not np.isfinite(drift_scale) or not 0 <= drift_scale <= 1:
+            raise ValueError("drift_scale must be finite and between 0 and 1")
+        if panel_steps is not None:
+            raise ValueError("Trend calibration is an experimental daily-only mode")
     rng = np.random.default_rng(seed)
+    from baselines.monthly_trend import POLICIES as MONTHLY_TRENDS
+    if monthly_trend not in MONTHLY_TRENDS:
+        raise ValueError("Unknown monthly trend policy")
+    if monthly_trend != "none" and panel_steps is None:
+        raise ValueError("Monthly trend requires explicit monthly observation-period steps")
     hist = {a: _series(panels, a, asof) for a in assets}
     returns_target = target_type == "log_return"
     monthly = panel_steps is not None
@@ -286,6 +323,10 @@ def _draw(
         else np.array([hist[a].iloc[-1] for a in assets], dtype=float)
     )
     drift = steps.mean().to_numpy(dtype=float) if returns_target else np.zeros(len(assets))
+    if drift_scale is not None:
+        # Example: a half trend adds 5 mean daily changes at horizon 10.
+        # None preserves the deployed level/return policy; only the centre changes.
+        drift = drift_scale * steps.mean().to_numpy(dtype=float)
     sd = steps.std().to_numpy(dtype=float)
     if volatility == "ewma":
         # Example: an observation 20 rows older gets half as much weight.
@@ -293,6 +334,7 @@ def _draw(
         sd = np.sqrt(
             steps.ewm(halflife=EWMA_HALFLIFE, adjust=True).var(bias=False).iloc[-1]
         ).to_numpy(dtype=float)
+    sd = sd * width_scale
     corr = steps.corr().to_numpy(dtype=float)
     corr = np.nan_to_num(corr, nan=0.0)
     np.fill_diagonal(corr, 1.0)
@@ -304,9 +346,18 @@ def _draw(
     if monthly:
         panel_steps = cast(np.ndarray, panel_steps)
         out = _monthly_walk(rng, hist, horizons, panel_steps, last, sd, chol, n_draws)
+        from baselines.monthly_trend import centre_shifts
+        trend_shifts, trend_meta = centre_shifts(hist, panel_steps, monthly_trend)
+        if monthly_trend != "none":
+            out += trend_shifts
         return out, {
             "last": {a: float(last[i]) for i, a in enumerate(assets)},
             "step_unit": "month",
+            "monthly_trend": trend_meta,
+            "centre_shifts": {
+                a: {str(h): float(trend_shifts[i, j]) for j, h in enumerate(horizons)}
+                for i, a in enumerate(assets)
+            },
             "step_sd": {a: float(sd[i]) for i, a in enumerate(assets)},
             "n_history_rows": int(len(steps)),
             "target_type": target_type,
@@ -323,23 +374,50 @@ def _draw(
             },
         }
     out = np.empty((n_draws, len(assets), len(horizons)), dtype=float)
+    if statistical_model != 'gaussian':
+        from baselines.adaptive_distribution import draw_paths
+        out, model_meta = draw_paths(steps.to_numpy(), last, drift, horizons, n_draws, rng, model=statistical_model)
+        longest = str(max(horizons))
+        horizon_sd = {a: {str(h): float(np.sqrt(model_meta['cumulative_variance'][str(h)][i])) for h in horizons} for i, a in enumerate(assets)}
+        return out, {
+            'statistical_model': statistical_model, 'distribution_parameters': model_meta,
+            'innovation': statistical_model, 'last': dict(zip(assets, last.tolist())),
+            'daily_sd': {a: horizon_sd[a][longest]/np.sqrt(max(horizons)) for a in assets},
+            'horizon_sd': horizon_sd, 'n_history_rows': len(steps), 'target_type': target_type,
+            'daily_drift': dict(zip(assets, drift.tolist())),
+            'drift_scale': None, 'width_scale': 1., 'volatility': statistical_model,
+            'ewma_halflife_observations': None,
+        }
     path = np.zeros((n_draws, len(assets)), dtype=float)
     previous_horizon = 0
+    # Resample entire centred vectors to preserve cross-asset skew and dependence.
+    # Correct finite-population variance to match the sample covariance estimate.
+    empirical = (steps.to_numpy() - steps.mean().to_numpy()) * (
+        np.sqrt(len(steps) / (len(steps) - 1)) * width_scale
+    ) if innovation == "bootstrap" else None
     # Example: day 20 reuses day 5, then adds 15 days of new shocks.
     # Gaussian increments can be sampled in blocks without visiting every day.
     for hi in np.argsort(horizons):
         h = horizons[hi]
-        z = rng.standard_normal((n_draws, len(assets))) @ chol.T
-        path += z * (sd * np.sqrt(h - previous_horizon))
-        centre = drift * h if returns_target else last
+        if empirical is None:
+            z = rng.standard_normal((n_draws, len(assets))) @ chol.T
+            path += z * (sd * np.sqrt(h - previous_horizon))
+        else:
+            # Visit each business-day step; memory stays bounded by draw count.
+            for _ in range(h - previous_horizon):
+                path += empirical[rng.integers(len(empirical), size=n_draws)]
+        centre = last + drift * h
         out[:, :, hi] = centre + path
         previous_horizon = h
     meta = {
+        "innovation": innovation,
         "last": {a: float(last[i]) for i, a in enumerate(assets)},
         "daily_sd": {a: float(sd[i]) for i, a in enumerate(assets)},
         "n_history_rows": int(len(steps)),
         "target_type": target_type,
         "daily_drift": {a: float(drift[i]) for i, a in enumerate(assets)},
+        "drift_scale": drift_scale,
+        "width_scale": width_scale,
         "volatility": volatility,
         "ewma_halflife_observations": EWMA_HALFLIFE if volatility == "ewma" else None,
     }
@@ -357,6 +435,12 @@ def _rationale(
 ) -> str:
     n_docs = len(list(text_dir.glob("*.txt"))) if text_dir.is_dir() else 0
     if stats.get("step_unit") == "month":
+        trend = stats.get("monthly_trend", {"policy": "none"})
+        trend_description = (
+            "No trend adjustment is made."
+            if trend['policy'] == 'none' else
+            f"Monthly trend policy: {trend['policy']}; twelve earlier monthly changes estimate the centre shift."
+        )
         rows = "\n".join(
             f"| {a} | {h} | {stats['last'][a]:.4f} | {stats['panel_steps'][a][str(h)]} | "
             f"{stats['step_sd'][a]:.4f} | {stats['horizon_sd'][a][str(h)]:.4f} |"
@@ -373,7 +457,7 @@ Each anchor is the last available monthly observation at or before the cutoff.
 The panel can lag the as-of. Monthly steps include that publication lag and end at
 its explicitly supplied observation period. The horizon key is unchanged.
 The monthly standard deviation is estimated from consecutive monthly changes,
-using {stats["n_history_rows"]} overlapping observations. No drift adjustment is made.
+using {stats["n_history_rows"]} overlapping observations. {trend_description}
 
 | asset | horizon key | anchor | monthly steps | monthly sd | sd at horizon |
 |---|---|---|---|---|---|
@@ -387,6 +471,32 @@ The marginal standard deviation is monthly sd times the square root of monthly s
 No text adjustment is made. {n_docs} text document(s) were present and none was read.
 """
     returns_target = stats.get("target_type") == "log_return"
+    if stats.get('statistical_model', 'gaussian') != 'gaussian':
+        parameters = stats['distribution_parameters']
+        rows = '\n'.join(f"| {a} | {h} | {stats['last'][a] + stats['daily_drift'][a]*h:.6g} | {stats['horizon_sd'][a][str(h)]:.6g} |" for a in assets for h in horizons)
+        variance_description = 'Conditional variance responds to past squared shocks and reverts towards historical variance.' if parameters['alpha'] is not None else 'Forecast variance uses the constant historical estimate.'
+        tail_description = 'A unit-variance Student-t scale is shared across each entire forecast path.' if parameters['shared_scale_per_path'] else 'Forecast innovations are Gaussian; no latent tail scale is used.'
+        return f'''# Forecast rationale — {unit_id}
+
+As of {asof}; statistical model: {stats['statistical_model']}; {n_draws} joint draws.
+Only pre-cutoff daily changes enter the model. Level centres remain at their anchors;
+return centres retain the historical mean log-return drift.
+
+{variance_description}
+{tail_description}
+Fixed variance coefficients are assumptions, not fitted GARCH estimates. Historical
+tail parameters, when estimated, use a documented fourth-moment heuristic.
+Future Gaussian increments are independent conditional on any shared latent scale.
+Monthly CPI uses its separate existing monthly sampler.
+
+Parameters: {parameters}
+
+| asset | authored horizon | forecast centre | standard deviation at horizon |
+|---|---|---|---|
+{rows}
+
+No text or language model is used in this statistical-only forecast.
+'''
     anchor = (
         "Zero for every asset: the target sums log(1 + daily simple return) over the horizon. "
         "The last observed daily return belongs to the history, not to that future total."
@@ -501,7 +611,27 @@ def main(argv: list[str] | None = None) -> int:
         "--no-text", action="store_true",
         help="Use the statistical forecast only; never call a model (text ablation).",
     )
+    p.add_argument(
+        "--text-policy", choices=("conservative", "structured"), default="conservative",
+        help="Experimental structured mode validates causal drivers and changes daily centres only.",
+    )
+    p.add_argument("--text-cache", type=pathlib.Path,
+                   help="Optional exact-input reply cache outside this repo, for structured mode.")
+    p.add_argument("--text-scale", type=float, default=1.,
+                   help="Experimental structured correction multiplier in [0,1]; zero disables model calls.")
+    p.add_argument("--monthly-trend", choices=("auto", "none", "recent", "half", "damped"), default="auto",
+                   help="Auto uses damped trend for declared monthly CPI; none retains the no-trend control.")
+    p.add_argument('--statistical-model', choices=('gaussian', 'adaptive-gaussian', 'student-t', 'adaptive-t', 'historical-t'), default='gaussian',
+                   help='Experimental daily conditional variance / heavy-tail model; monthly forecasts retain their sampler.')
     a = p.parse_args(argv)
+    if not np.isfinite(a.text_scale) or not 0 <= a.text_scale <= 1:
+        p.error("--text-scale must be finite and between zero and one")
+    if a.text_scale != 1. and a.text_policy != "structured" and not a.no_text:
+        p.error("--text-scale requires --text-policy structured")
+    if a.text_policy == "structured" and a.text_scale == 0:
+        a.no_text = True
+    if a.text_cache is not None and a.text_policy != "structured" and not a.no_text:
+        p.error("--text-cache requires --text-policy structured")
 
     # --panels names the unit root (contract) but a card may still keep a panels/ subdir, so look
     # in the panels dir first and only then one level up. Deriving it as parent/ unconditionally
@@ -519,6 +649,12 @@ def main(argv: list[str] | None = None) -> int:
     import tomllib
 
     card = tomllib.loads(card_path.read_text())
+    from baselines.monthly_trend import resolve_cpi_policy
+    requested_monthly_trend = a.monthly_trend
+    try:
+        a.monthly_trend = resolve_cpi_policy(card, a.monthly_trend)
+    except ValueError as exc:
+        p.error(str(exc))
     tgt = card["targets"]
     assets = list(tgt["asset_ids"])
     horizons = [int(h) for h in tgt["horizons"]]
@@ -545,6 +681,11 @@ def main(argv: list[str] | None = None) -> int:
                 "--panels", str(a.panels), "--text", str(a.text), "--asof", a.asof,
                 "--card", str(card_path), "--out", str(a.out),
                 "--n-draws", str(n_draws), "--seed", str(a.seed), "--conservative",
+                "--text-policy", a.text_policy,
+                "--text-scale", str(a.text_scale),
+                "--monthly-trend", requested_monthly_trend,
+                "--statistical-model", a.statistical_model,
+                *(["--text-cache", str(a.text_cache)] if a.text_cache is not None else []),
             ],
             house_only=True,
         )
@@ -554,6 +695,8 @@ def main(argv: list[str] | None = None) -> int:
         panel_steps = _monthly_inputs(panels, card, card_path, a.asof)
     except HorizonMetadataError as exc:
         raise SystemExit(str(exc)) from None
+    if requested_monthly_trend == 'auto' and panel_steps is None:
+        a.monthly_trend = 'none'
     samples, stats = _draw(
         panels,
         assets,
@@ -563,6 +706,8 @@ def main(argv: list[str] | None = None) -> int:
         a.seed,
         target_type=tgt.get("target_type", "level"),
         panel_steps=panel_steps,
+        monthly_trend=a.monthly_trend,
+        statistical_model=a.statistical_model,
     )
 
     out_dir = a.out.parent
@@ -590,9 +735,13 @@ def main(argv: list[str] | None = None) -> int:
                 "reasoning_skipped_reason": "disabled by --no-text",
                 "text_policy": "disabled",
                 "text_adjustments": {},
+                "monthly_trend": stats.get("monthly_trend"),
+                "monthly_centre_shifts": stats.get("centre_shifts"),
+                'statistical_model': stats.get('statistical_model', 'gaussian'),
+                'distribution_parameters': stats.get('distribution_parameters'),
                 "rationale": {
                     "file": _RATIONALE_NAME,
-                    "method": "joint gaussian random walk, no text",
+                    "method": f"joint {stats.get('statistical_model', 'gaussian')} forecast, no text",
                 },
             },
             indent=2,

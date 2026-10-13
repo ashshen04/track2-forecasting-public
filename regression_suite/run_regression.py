@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""T2 scoring regression: golden fixtures in, pinned verdicts and composites out.
+"""## Executive summary (read this first)
+
+Check scoring gates with synthetic fixtures and verify forecast semantics.
+For example, cumulative returns start at zero and use log(1 + daily return).
+The CLI uses 120 recent steps; adapter scaffolds use their full supplied history.
+
+T2 scoring regression: golden fixtures in, pinned verdicts and composites out.
 
 Modeled on track3's regression_suite. Motivation is recorded rather than implied: the CodaBench
 driver's first-ever real T2 invocation (2026-08-16) crashed with KeyError 'card' and, patched,
@@ -35,8 +41,8 @@ Checks, in order:
  13  log-return     on reg-t2-logreturn (panel rows are decimal simple returns, target is the
                     cumulative log return at 21 and 127 BD) the CLI and the shipped baseline
                     both centre at h x mean(log1p(r)) -- anchored at exactly 0, not at the
-                    last panel row -- with spread sd(log1p(r)) x sqrt(h), and agree with each
-                    other; the CLI's history window is pinned to the 260 pre-as-of rows.
+                    last panel row -- with spread sd(log1p(r)) x sqrt(h), using each model's
+                    own window; CLI uses 120 steps, baseline uses 260 pre-as-of rows.
                     Pins the fix for public #2 (staging PR #14): before it, the CLI anchored
                     every card at the last observed row and differenced an already-differenced
                     series. The 127-BD horizon separates log1p from raw simple returns
@@ -217,16 +223,20 @@ def _log_return_anchoring():
     panel = panel_raw[_pd.to_datetime(panel_raw["date"]) <= _pd.Timestamp(asof)]
     steps = {a: _np.log1p(panel[panel["asset"] == a].sort_values("date")["value"].to_numpy())
              for a in assets}
-    want_centre = {(a, h): h * float(s.mean()) for a, s in steps.items() for h in horizons}
-    want_sd = {(a, h): float(s.std(ddof=1)) * _np.sqrt(h) for a, s in steps.items()
+    baseline_centre = {(a, h): h * float(s.mean()) for a, s in steps.items() for h in horizons}
+    baseline_sd = {(a, h): float(s.std(ddof=1)) * _np.sqrt(h) for a, s in steps.items()
+                   for h in horizons}
+    cli_steps = {a: s[-120:] for a, s in steps.items()}
+    want_centre = {(a, h): h * float(s.mean()) for a, s in cli_steps.items() for h in horizons}
+    want_sd = {(a, h): float(s.std(ddof=1)) * _np.sqrt(h) for a, s in cli_steps.items()
                for h in horizons}
     last_row = {a: float(panel[panel["asset"] == a].sort_values("date")["value"].iloc[-1])
                 for a in assets}
     check("the last SYN_MOM row is far from the 21-BD drift centre (the trap is armed)",
-          abs(last_row["SYN_MOM"] - want_centre["SYN_MOM", 21]) > 0.03,
-          f"last {last_row['SYN_MOM']:.4f} centre {want_centre['SYN_MOM', 21]:.4f}")
+          abs(last_row["SYN_MOM"] - baseline_centre["SYN_MOM", 21]) > 0.03,
+          f"last {last_row['SYN_MOM']:.4f} baseline centre {baseline_centre['SYN_MOM', 21]:.4f}")
 
-    # Exact pins first: the anchor is 0.0 and the history window is the 260 pre-as-of rows.
+    # Exact pins first: the anchor is 0.0 and the CLI window is the latest 120 steps.
     # These are properties of the producer, not of a sample, so they are asserted exactly.
     try:
         _, stats = cli._draw({"panel_factors": panel_raw}, assets, horizons, asof, 500, 3,
@@ -236,8 +246,11 @@ def _log_return_anchoring():
         check("CLI accepts target_type", False, str(exc))
     check("CLI anchors every asset at exactly 0.0",
           stats["last"] == {a: 0.0 for a in assets}, str(stats["last"]))
-    check("CLI history window is the 260 pre-as-of rows",
-          stats["n_history_rows"] == 260, str(stats["n_history_rows"]))
+    check("CLI history window is the latest 120 pre-as-of rows",
+          stats["n_history_rows"] == 120, str(stats["n_history_rows"]))
+    check("CLI daily drift uses the latest 120 log1p returns",
+          all(abs(stats['daily_drift'][a] - float(cli_steps[a].mean())) < 1e-12
+              for a in assets), str(stats.get('daily_drift')))
 
     # Statistical pins at the contract ceiling of 20,000 draws. SE of a centre at h=127 is
     # ~0.124/sqrt(20000) = 0.0009, so the 0.004 tolerance is ~4.5 SE for the correct producer
@@ -245,7 +258,8 @@ def _log_return_anchoring():
     n = 20000
     out = pathlib.Path(tempfile.mkdtemp())
     cli.main(["--panels", str(unit), "--text", str(unit / "text"), "--asof", asof,
-              "--out", str(out / "forecast.parquet"), "--n-draws", str(n), "--seed", "3"])
+              "--out", str(out / "forecast.parquet"), "--n-draws", str(n), "--seed", "3",
+              "--no-text"])
     draws = _pd.read_parquet(out / "forecast.parquet")
     meta = json.loads((out / "forecast_meta.json").read_text())
     check("CLI meta records the log_return target", meta.get("target") == "log_return",
@@ -290,11 +304,14 @@ def _log_return_anchoring():
             v = res.samples[:, ai, hi]
             bc, bs = float(v.mean()), float(v.std(ddof=1))
             check(f"baseline {a} h={h}: centre is h x mean(log1p(r))",
-                  abs(bc - want_centre[a, h]) < 0.004, f"got {bc:.4f} want {want_centre[a, h]:.4f}")
+                  abs(bc - baseline_centre[a, h]) < 0.004,
+                  f"got {bc:.4f} want {baseline_centre[a, h]:.4f}")
             check(f"baseline {a} h={h}: spread is sd(log1p(r)) x sqrt(h)",
-                  abs(bs / want_sd[a, h] - 1.0) < 0.10, f"got {bs:.4f} want {want_sd[a, h]:.4f}")
-            check(f"baseline and CLI agree on {a} h={h}", abs(bc - cli_centre[a, h]) < 0.004,
-                  f"baseline {bc:.4f} cli {cli_centre[a, h]:.4f}")
+                  abs(bs / baseline_sd[a, h] - 1.0) < 0.10,
+                  f"got {bs:.4f} want {baseline_sd[a, h]:.4f}")
+            residual_difference = (bc - baseline_centre[a, h]) - (cli_centre[a, h] - want_centre[a, h])
+            check(f"baseline and CLI sampling errors agree on {a} h={h}",
+                  abs(residual_difference) < 0.004, f"residual difference {residual_difference:.4f}")
 
 
 def _redaction_control(unit):
@@ -525,7 +542,7 @@ def main():
     check("no dates available: falls back to raw diffs unchanged", nodates.size == 7,
           f"kept {nodates.size}")
 
-    print("13. log-return anchoring: CLI and baseline centre at 0 + drift x h, and agree")
+    print("13. log-return anchoring: CLI and baseline centre at 0 + drift x h in their own windows")
     _log_return_anchoring()
 
     print()
