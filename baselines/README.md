@@ -192,6 +192,44 @@ of a policy effect. Comparing it with the same statistical forecast without text
 is a separate experiment. Tests with simulated replies establish mechanics only.
 With no model endpoint configured, it records the unchanged statistical fallback.
 
+### Optional structured evidence in the forecast command
+
+For example, run the same daily card with `forecast ... --text-policy structured`.
+Add `--text-cache /private/tmp/t2-forecast-cache` to reuse the exact analysis when
+changing only the draw seed or draw count. A cache stores a model reply for reuse.
+It stays outside this public repository. Inputs, model settings and endpoint
+identity determine reuse. Cached replies still pass all evidence checks.
+
+This experimental policy requests cited causal drivers for all assets in one call.
+Code converts currency strength into the authored quote direction. Only a supported
+future increment within the horizon can shift the centre. Opposing actionable
+directions cause abstention. Unclear pricing limits the longest-horizon shift to
+0.10 standard deviations; cited evidence that the change is unlikely priced in
+allows 0.25. These constants are untuned bounds, not confidence probabilities.
+The shift grows linearly with daily horizons. Joint shocks and forecast spread
+are preserved. This is a timing approximation, not an event-date model.
+
+The default remains conservative. Monthly cards retain their statistical forecast
+without a model request in structured mode because integer horizon keys cannot
+be interpreted as daily steps. `--no-text` disables all model calls and cache use.
+No supported driver, conflicting drivers and invalid evidence retain the statistical
+forecast. Metadata distinguishes abstention from a changed forecast and records
+the resolver audit and cache hits. Cache hits are not independent model decisions.
+
+Use `scripts/validate_text.py --policy structured --excerpt-policy relevant` for
+the matching daily historical experiment. It uses the same prompt, resolver,
+shift policy and paired random draws as the formal entrypoint. An optional
+`--cache-dir` reuses identical analyses across replayed draw seeds. Its synthetic
+parity test checks exact equality with formal forecast samples. This establishes
+implementation parity, not forecasting accuracy. See [BACKTEST.md](../docs/BACKTEST.md).
+
+Revision `structured-drivers-v3-event-time` additionally requires a source-bound
+announcement date, a cited effective date and a separately cited, dated future
+increment. Completed actions alone cannot trigger shifts. A late future action
+does not change earlier horizon samples. Missing dates cause driver abstention.
+These rules invalidate older reply caches; date presence does not prove causal
+meaning. See [EVENT-TIMING.md](../docs/EVENT-TIMING.md) for examples and audit fields.
+
 ---
 
 ## Comparing your agent to the baselines

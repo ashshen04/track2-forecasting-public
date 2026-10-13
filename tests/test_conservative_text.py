@@ -39,3 +39,18 @@ def test_conservative_adjustments_drop_unsupported_replies(doc_ids, because):
     np.testing.assert_array_equal(adjusted, samples)
     assert matched == 0
     assert "evidence" in ledger["A"]["note"]
+
+
+def test_zero_adjustment_preserves_every_draw_exactly():
+    # Subtracting and adding the centre can round tiny return samples, even when
+    # the model requests no change. A neutral reply must preserve the control.
+    samples = np.array([1e-12, 0.002, 0.003, 0.001]).reshape(4, 1, 1)
+    reply = {"assets": {"A": {"drift_bp": 0, "vol_scale": 1,
+                               "because": "No directional evidence in doc-1.",
+                               "doc_ids": ["doc-1"]}}}
+    adjusted, _, matched = agent.apply_adjustment(
+        samples, ["A"], {"A": 0}, {"A": 0.01}, reply,
+        target_type="log_return", conservative=True, valid_doc_ids={"doc-1"},
+    )
+    assert matched == 1
+    np.testing.assert_array_equal(adjusted, samples)
